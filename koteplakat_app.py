@@ -69,6 +69,16 @@ def props_to_dict(line_item) -> dict:
             for p in (line_item.get("properties") or [])}
 
 
+def normaliser_kartstil(kartstil: str) -> str:
+    """Shopify sender 'Mørkt'/'Lyst' (med ø, fra koteplakat-fargevelger.liquid),
+    men selve filnavnene på R2/disk bruker 'Morkt' UTEN ø (ASCII) - samme
+    konvensjon som hele Python-pipelinen ellers (Moerke.py,
+    splitt_transparent_master.py, osv). Normaliser her, IKKE i liquid-en -
+    kunden skal fortsatt se 'Mørkt' korrekt stavet i grensesnittet."""
+    k = kartstil.strip().lower()
+    return "Lyst" if k.startswith("lys") else "Morkt"
+
+
 def gyldig_hex(s: str) -> bool:
     s = (s or "").lstrip("#")
     if len(s) != 6:
@@ -109,7 +119,7 @@ def build_gelato_items(order) -> list:
     for li in order.get("line_items", []):
         pr = props_to_dict(li)
         hex_farge = pr.get("bakgrunnsfarge (hex)") or pr.get("bakgrunnsfarge") or ""
-        kartstil = pr.get("kartstil") or "Mørkt"
+        kartstil = normaliser_kartstil(pr.get("kartstil") or "Mørkt")
         motiv = li.get("title") or li.get("name") or ""
 
         if not gyldig_hex(hex_farge):
