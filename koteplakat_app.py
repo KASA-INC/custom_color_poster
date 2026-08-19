@@ -114,6 +114,35 @@ def upload_pdf(data: bytes, key: str) -> str:
     return f"{PUBLIC_BASE}/{key}"
 
 
+def _behandlet_key(order_id) -> str:
+    return f"{KILDER_PREFIX}/_behandlede_ordre/{order_id}.json"
+
+
+def allerede_behandlet(order_id) -> bool:
+    """Sjekker om denne Shopify-ordren allerede er sendt til Gelato tidligere.
+
+    NØDVENDIG fordi Shopify garantert kan levere samme webhook flere ganger
+    (retries ved treg respons/cold start, eller flere webhook-abonnement på
+    samme topic/URL uten at man vet det) - uten en slik sperre opprettes én
+    Gelato-ordre PER levering, ikke én per faktisk Shopify-ordre. Lagres i
+    S3/R2 (IKKE i minne) nettopp fordi denne tjenesten typisk kjører på en
+    "sovende" instans (Render free/hobby) som kan starte helt på nytt mellom
+    to leveringer av samme webhook - en in-memory sperre ville da ikke
+    hjulpet i det hele tatt."""
+    s3 = _s3_klient()
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=_behandlet_key(order_id))
+        return True
+    except Exception:
+        return False
+
+
+def merk_behandlet(order_id):
+    s3 = _s3_klient()
+    s3.put_object(Bucket=S3_BUCKET, Key=_behandlet_key(order_id),
+                  Body=b"{}", ContentType="application/json")
+
+
 def build_gelato_items(order) -> list:
     items = []
     for li in order.get("line_items", []):
@@ -163,6 +192,14 @@ def gelato_address(order) -> dict:
 
 
 def process_order(order: dict):
+    order_id = order.get("id")
+    if allerede_behandlet(order_id):
+        log.info("Ordre %s er allerede behandlet tidligere - hopper over "
+                  "(duplikat webhook-levering fra Shopify). Ingen ny "
+                  "Gelato-ordre opprettet.", order_id)
+        return
+    merk_behandlet(order_id)  # merk FØR vi begynner - lukker kappløpsvinduet mest mulig
+
     items = build_gelato_items(order)
     if not items:
         log.info("Ordre %s: ingen koteplakat-linjer, hopper over.", order.get("id"))
