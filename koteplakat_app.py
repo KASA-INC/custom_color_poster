@@ -20,7 +20,7 @@ spesifikke Gelato-produkt).
 VIKTIG: Skru AV Gelatos innebygde Shopify-kobling for disse produktene,
 ellers opprettes ordrene to ganger.
 """
-import base64, hashlib, hmac, json, logging, os
+import base64, hashlib, hmac, json, logging, os, threading
 
 import boto3
 import requests
@@ -114,6 +114,12 @@ def upload_pdf(data: bytes, key: str) -> str:
     return f"{PUBLIC_BASE}/{key}"
 
 
+# Serialiserer sjekk+merk innen samme instans. Viktig når Render våkner fra dvale:
+# da leveres originalen og Shopifys retry(er) nesten samtidig, og uten lås kan
+# begge passere allerede_behandlet() før noen har rukket å skrive markøren.
+_KLAIM_LAAS = threading.Lock()
+
+
 def _behandlet_key(order_id) -> str:
     return f"{KILDER_PREFIX}/_behandlede_ordre/{order_id}.json"
 
@@ -135,6 +141,15 @@ def allerede_behandlet(order_id) -> bool:
         return True
     except Exception:
         return False
+
+
+def fjern_markor(order_id):
+    """Fjerner 'behandlet'-markøren igjen (brukes når Gelato-kallet feilet,
+    slik at ordren kan sendes på nytt via 'Resend webhook' i Shopify)."""
+    try:
+        _s3_klient().delete_object(Bucket=S3_BUCKET, Key=_behandlet_key(order_id))
+    except Exception as e:
+        log.error("Klarte ikke fjerne markør for ordre %s: %s", order_id, e)
 
 
 def merk_behandlet(order_id):
@@ -193,17 +208,32 @@ def gelato_address(order) -> dict:
 
 def process_order(order: dict):
     order_id = order.get("id")
-    if allerede_behandlet(order_id):
-        log.info("Ordre %s er allerede behandlet tidligere - hopper over "
-                  "(duplikat webhook-levering fra Shopify). Ingen ny "
-                  "Gelato-ordre opprettet.", order_id)
-        return
-    merk_behandlet(order_id)  # merk FØR vi begynner - lukker kappløpsvinduet mest mulig
+    with _KLAIM_LAAS:
+        if allerede_behandlet(order_id):
+            log.info("Ordre %s er allerede behandlet tidligere - hopper over "
+                      "(duplikat webhook-levering fra Shopify). Ingen ny "
+                      "Gelato-ordre opprettet.", order_id)
+            return
+        merk_behandlet(order_id)  # merk FØR vi begynner, inne i låsen
 
+    lyktes = False
+    try:
+        lyktes = _send_til_gelato(order)
+    except Exception:
+        log.exception("Ordre %s: uventet feil under behandling", order_id)
+    finally:
+        if not lyktes:
+            # Gelato avviste, ingen linjer, DRY_RUN eller krasj -> frigi markøren,
+            # ellers kan ordren aldri sendes på nytt ('Resend webhook').
+            fjern_markor(order_id)
+
+
+def _send_til_gelato(order: dict) -> bool:
+    """True KUN hvis Gelato faktisk godtok ordren."""
     items = build_gelato_items(order)
     if not items:
         log.info("Ordre %s: ingen koteplakat-linjer, hopper over.", order.get("id"))
-        return
+        return False
     payload = {
         "orderType": "order",
         "orderReferenceId": f"shopify-{order['id']}",
@@ -215,15 +245,15 @@ def process_order(order: dict):
     }
     if DRY_RUN:
         log.info("DRY_RUN - ville sendt til Gelato:\n%s", json.dumps(payload, indent=2, ensure_ascii=False))
-        return payload
+        return False  # ingenting sendt -> ikke la markøren stå
     r = requests.post(GELATO_URL, headers={"Content-Type": "application/json",
                                            "X-API-KEY": GELATO_API_KEY},
                       data=json.dumps(payload), timeout=60)
     if r.status_code >= 300:
         log.error("Gelato-feil %s: %s", r.status_code, r.text)
-    else:
-        log.info("Gelato-ordre opprettet: %s", r.json().get("id"))
-    return payload
+        return False
+    log.info("Gelato-ordre opprettet: %s", r.json().get("id"))
+    return True
 
 
 @app.post("/webhooks/orders-paid")
@@ -232,6 +262,15 @@ async def orders_paid(request: Request, bg: BackgroundTasks):
     if not verify_hmac(raw, request.headers.get("X-Shopify-Hmac-Sha256", "")):
         return Response(status_code=401, content="invalid hmac")
     order = json.loads(raw)
+    h = request.headers
+    # DIAGNOSE: viser hvilken tjeneste/instans og hvilken webhook som mottok ordren.
+    # Samme Event-Id to ganger = Shopify leverte samme hendelse flere ganger (retry/abonnement).
+    # Ulik Webhook-Id/Host/Render-tjeneste = flere abonnement eller flere tjenester.
+    log.info("WEBHOOK mottatt: ordre=%s topic=%s event_id=%s webhook_id=%s host=%s "
+             "render_tjeneste=%s render_instans=%s",
+             order.get("id"), h.get("X-Shopify-Topic"), h.get("X-Shopify-Event-Id"),
+             h.get("X-Shopify-Webhook-Id"), h.get("host"),
+             os.environ.get("RENDER_SERVICE_NAME"), os.environ.get("RENDER_INSTANCE_ID"))
     bg.add_task(process_order, order)
     return {"ok": True}
 
@@ -239,3 +278,4 @@ async def orders_paid(request: Request, bg: BackgroundTasks):
 @app.get("/health")
 def health():
     return {"status": "ok", "produkt_uid": GELATO_PRODUCT_UID_50X70}
+
